@@ -71,7 +71,7 @@ def main():
 
     # Process each prompt and generate responses
     all_scores = []
-    for item in tqdm(dataset["train"].select(range(150)), desc="Generating responses"):
+    for item in tqdm(dataset["train"].select(range(100)), desc="Generating responses"):
         prompt = item["input"]
         # Apply chat template to format the prompt properly
         formatted_prompt = tokenizer.apply_chat_template([
