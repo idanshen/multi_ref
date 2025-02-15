@@ -4,6 +4,12 @@ from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from trl import GRPOConfig, GRPOTrainer
 
+"""
+TODO:
+- add evaluation on test set
+- implmenet bigger update to data ratio
+"""
+
 # Load and prep dataset
 
 SYSTEM_PROMPT = """
@@ -133,7 +139,7 @@ model = AutoModelForCausalLM.from_pretrained(
 ).to("cuda")
 
 ref_model = AutoModelForCausalLM.from_pretrained(
-    "",
+    ref_model_name,
     torch_dtype=torch.bfloat16,
     device_map=None
 ).to("cuda")
