@@ -2,7 +2,8 @@ import re
 import torch
 from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from trl import GRPOConfig, GRPOTrainer
+from grpo_trainer import GRPOTrainer
+from grpo_config import GRPOConfig
 
 """
 TODO:
@@ -129,7 +130,9 @@ training_args = GRPOConfig(
     use_vllm=True,
     vllm_gpu_memory_utilization=.3,
     vllm_device="cuda:0",
-    report_to="wandb"
+    report_to="wandb",
+    update_to_data_ratio=2,
+    vllm_max_model_len=2048
 )
 
 model = AutoModelForCausalLM.from_pretrained(
