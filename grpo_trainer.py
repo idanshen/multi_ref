@@ -1,3 +1,17 @@
+# Copyright 2025 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import textwrap
 import warnings
@@ -28,12 +42,13 @@ from transformers import (
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.utils import is_peft_available
 
-from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
-from trl.import_utils import is_vllm_available
-from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
-from trl.trainer.callbacks import SyncRefModelCallback
-from grpo_config import GRPOConfig
-from trl.trainer.utils import generate_model_card, get_comet_experiment_url, pad, selective_log_softmax
+from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
+from ..extras.profiling import profiling_decorator
+from ..import_utils import is_vllm_available
+from ..models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
+from .callbacks import SyncRefModelCallback
+from .grpo_config import GRPOConfig
+from .utils import generate_model_card, get_comet_experiment_url, pad, selective_log_softmax
 
 
 if is_peft_available():
@@ -41,6 +56,7 @@ if is_peft_available():
 
 if is_vllm_available():
     from vllm import LLM, SamplingParams
+    from vllm.sampling_params import GuidedDecodingParams
 
 if is_wandb_available():
     import wandb
@@ -52,26 +68,63 @@ RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
 class RepeatRandomSampler(Sampler):
     """
-    Sampler that repeats the indices of a dataset N times.
+    Sampler that repeats the indices of a dataset in a structured manner.
 
     Args:
         data_source (`Sized`):
             Dataset to sample from.
-        repeat_count (`int`):
-            Number of times to repeat each index.
-        seed (`Optional[int]`):
+        mini_repeat_count (`int`):
+            Number of times to repeat each index per batch.
+        batch_size (`int`, *optional*, defaults to `1`):
+            Number of unique indices per batch.
+        repeat_count (`int`, *optional*, defaults to `1`):
+            Number of times to repeat the full sampling process.
+        seed (`int` or `None`, *optional*, defaults to `None`):
             Random seed for reproducibility (only affects this sampler).
 
     Example:
     ```python
-    >>> sampler = RepeatRandomSampler(["a", "b", "c", "d"], repeat_count=2)
+    >>> sampler = RepeatRandomSampler(["a", "b", "c", "d", "e", "f", "g"], mini_repeat_count=2, batch_size=3, repeat_count=4)
     >>> list(sampler)
-    [2, 2, 0, 0, 3, 3, 1, 1]
+    [4, 4, 3, 3, 0, 0,
+     4, 4, 3, 3, 0, 0,
+     4, 4, 3, 3, 0, 0,
+     4, 4, 3, 3, 0, 0,
+
+     1, 1, 2, 2, 6, 6,
+     1, 1, 2, 2, 6, 6,
+     1, 1, 2, 2, 6, 6,
+     1, 1, 2, 2, 6, 6]
+    ```
+
+    ```txt
+    mini_repeat_count = 3
+          -   -   -
+         [0,  0,  0,  1,  1,  1,  2,  2,  2,  3,  3,  3,      |
+          4,  4,  4,  5,  5,  5,  6,  6,  6,  7,  7,  7,      |
+          8,  8,  8,  9,  9,  9, 10, 10, 10, 11, 11, 11,      |
+                                                                repeat_count = 2
+          0,  0,  0,  1,  1,  1,  2,  2,  2,  3,  3,  3,      |
+          4,  4,  4,  5,  5,  5,  6,  6,  6,  7,  7,  7,      |
+          8,  8,  8,  9,  9,  9, 10, 10, 10, 11, 11, 11, ...] |
+          ---------   ---------   ---------   ---------
+           ---------   ---------   ---------   ---------
+            ---------   ---------   ---------   ---------
+                         batch_size = 12
     ```
     """
 
-    def __init__(self, data_source: Sized, repeat_count: int, seed: Optional[int] = None):
+    def __init__(
+        self,
+        data_source: Sized,
+        mini_repeat_count: int,
+        batch_size: int = 1,
+        repeat_count: int = 1,
+        seed: Optional[int] = None,
+    ):
         self.data_source = data_source
+        self.mini_repeat_count = mini_repeat_count
+        self.batch_size = batch_size
         self.repeat_count = repeat_count
         self.num_samples = len(data_source)
         self.seed = seed
@@ -80,15 +133,25 @@ class RepeatRandomSampler(Sampler):
             self.generator.manual_seed(seed)
 
     def __iter__(self):
-        indexes = [
-            idx
-            for idx in torch.randperm(self.num_samples, generator=self.generator).tolist()
-            for _ in range(self.repeat_count)
-        ]
-        return iter(indexes)
+        # E.g., [2, 4, 3, 1, 0, 6, 5] (num_samples = 7)
+        indexes = torch.randperm(self.num_samples, generator=self.generator).tolist()
 
-    def __len__(self):
-        return self.num_samples * self.repeat_count
+        #    [2, 4, 3, 1, 0, 6, 5]
+        # -> [[2, 4, 3], [1, 0, 6], [5]]  (batch_size = 3)
+        indexes = [indexes[i : i + self.batch_size] for i in range(0, len(indexes), self.batch_size)]
+
+        #    [[2, 4, 3], [1, 0, 6], [5]]
+        # -> [[2, 4, 3], [1, 0, 6]]
+        indexes = [chunk for chunk in indexes if len(chunk) == self.batch_size]
+
+        for chunk in indexes:
+            for _ in range(self.repeat_count):
+                for index in chunk:
+                    for _ in range(self.mini_repeat_count):
+                        yield index
+
+    def __len__(self) -> int:
+        return self.num_samples * self.mini_repeat_count * self.repeat_count
 
 
 class GRPOTrainer(Trainer):
@@ -193,7 +256,6 @@ class GRPOTrainer(Trainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
-        ref_model: Optional[Union[str, PreTrainedModel]] = None,
     ):
         # Args
         if args is None:
@@ -231,20 +293,28 @@ class GRPOTrainer(Trainer):
                 )
 
         if peft_config is not None:
+            if not is_peft_available():
+                raise ImportError("PEFT is required to use `peft_config`. Run `pip install peft`.")
             model = get_peft_model(model, peft_config)
 
+        # Enable gradient checkpointing if requested
+        if args.gradient_checkpointing:
+            model = self._enable_gradient_checkpointing(model, args)
+
         # Reference model
-        if ref_model is not None:
-            self.ref_model = ref_model
+        self.beta = args.beta
+        if self.beta == 0.0:
+            # If beta is 0.0, the reference model is not needed
+            self.ref_model = None
         elif is_deepspeed_zero3_enabled():
             self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
-        elif not is_peft_model(model):
-            # If PEFT configuration is not provided, create a reference model based on the initial model.
-            self.ref_model = create_reference_model(model)
-        else:
+        elif is_peft_model(model):
             # If PEFT is used, the reference model is not needed since the adapter can be disabled
             # to revert to the initial model.
             self.ref_model = None
+        else:
+            # If PEFT configuration is not provided, create a reference model based on the initial model.
+            self.ref_model = create_reference_model(model)
 
         # Processing class
         if processing_class is None:
@@ -302,7 +372,14 @@ class GRPOTrainer(Trainer):
         self.num_generations = args.num_generations  # = G in the GRPO paper
         self.use_vllm = args.use_vllm
 
-        self.beta = args.beta
+        # Multi-step
+        self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
+        self.epsilon = args.epsilon
+        # Tracks the number of iterations (forward + backward passes), including those within a gradient accumulation cycle.
+        self._step = 0
+        # Buffer the batch to reuse generated outputs across multiple updates. For more details, see
+        # `_get_train_sampler` and `_prepare_inputs`.
+        self._buffered_inputs = [None] * args.gradient_accumulation_steps
 
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
         # input tensor associated with the key "input_ids". However, in GRPO, the sampled data does not include the
@@ -401,9 +478,19 @@ class GRPOTrainer(Trainer):
                         enable_prefix_caching=True,
                         max_model_len=self.args.vllm_max_model_len,
                     )
+
+                # Guided decoding, if enabled
+                if args.vllm_guided_decoding_regex is not None:
+                    guided_decoding = GuidedDecodingParams(backend="outlines", regex=args.vllm_guided_decoding_regex)
+                else:
+                    guided_decoding = None
+
+                # Sampling parameters
                 self.sampling_params = SamplingParams(
                     temperature=args.temperature,
                     max_tokens=self.max_completion_length,
+                    guided_decoding=guided_decoding,
+                    n=args.num_generations,
                 )
 
             self._last_loaded_step = 0  # tag to avoid useless loading during grad accumulation
@@ -450,26 +537,76 @@ class GRPOTrainer(Trainer):
             self._signature_columns = ["prompt"]
 
     def _get_train_sampler(self) -> Sampler:
-        # Returns a sampler that ensures each prompt is repeated across multiple processes. This guarantees that
-        # identical prompts are distributed to different GPUs, allowing rewards to be computed and normalized correctly
-        # within each prompt group. Using the same seed across processes ensures consistent prompt assignment,
-        # preventing discrepancies in group formation.
-        return RepeatRandomSampler(self.train_dataset, self.num_generations, seed=self.args.seed)
+        # Returns a sampler that
+        # 1. ensures each prompt is repeated across multiple processes. This guarantees that identical prompts are
+        #    distributed to different GPUs, allowing rewards to be computed and normalized correctly within each prompt
+        #    group. Using the same seed across processes ensures consistent prompt assignment, preventing discrepancies
+        #    in group formation.
+        # 2. repeats the batch multiple times to allow reusing generaations across multiple updates. Refer to
+        #    _prepare_inputs to see how the generations are stored and reused.
+
+        #                             |     GPU 0     |     GPU 1     |     GPU 2    |
+        #
+        #    global_step   step         <───────>  num_generations=3
+        #                               <───────────> per_device_train_batch_size=4
+        #         0          0          0   0   0   1   1   1   2   2   2   3   3   3  │
+        #         0          1          4   4   4   5   5   5   6   6   6   7   7   7  │ gradient_accumulation=3
+        #         0          2          8   8   8   9   9   9  10  10  10  11  11  11  │
+        #
+        #         1          3          0   0   0   1   1   1   2   2   2   3   3   3  │ num_iterations=2:
+        #         1          4          4   4   4   5   5   5   6   6   6   7   7   7  │ reuse the batch once
+        #         1          5          8   8   8   9   9   9  10  10  10  11  11  11  │
+        #
+        #         2          6         12  12  12  13  13  13  14  14  14  15  15  15
+        #         2          7         16  16  16  17  17  17  18  18  18  19  19  19
+        #         2          8         20  20  20  21  21  21  22  22  22  23  23  23
+        #                                              ...
+        effective_batch_size = (
+            self.args.per_device_train_batch_size
+            * self.accelerator.num_processes
+            * self.args.gradient_accumulation_steps
+        )
+        return RepeatRandomSampler(
+            data_source=self.train_dataset,
+            mini_repeat_count=self.num_generations,
+            batch_size=effective_batch_size // self.num_generations,
+            repeat_count=self.num_iterations,
+            seed=self.args.seed,
+        )
 
     def _get_eval_sampler(self, eval_dataset) -> Sampler:
-        # Returns a sampler that ensures each prompt is repeated across multiple processes. This guarantees that
-        # identical prompts are distributed to different GPUs, allowing rewards to be computed and normalized correctly
-        # within each prompt group. Using the same seed across processes ensures consistent prompt assignment,
-        # preventing discrepancies in group formation.
-        return RepeatRandomSampler(eval_dataset, self.num_generations, seed=self.args.seed)
+        # See _get_train_sampler for an explanation of the sampler.
+        return RepeatRandomSampler(
+            data_source=eval_dataset,
+            mini_repeat_count=self.num_generations,
+            seed=self.args.seed,
+        )
+
+    def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: GRPOConfig) -> PreTrainedModel:
+        """Enables gradient checkpointing for the model."""
+        # Ensure use_cache is disabled
+        model.config.use_cache = False
+
+        # Enable gradient checkpointing on the base model for PEFT
+        if is_peft_model(model):
+            model.base_model.gradient_checkpointing_enable()
+        # Enable gradient checkpointing for non-PEFT models
+        else:
+            model.gradient_checkpointing_enable()
+
+        gradient_checkpointing_kwargs = args.gradient_checkpointing_kwargs or {}
+        use_reentrant = (
+            "use_reentrant" not in gradient_checkpointing_kwargs or gradient_checkpointing_kwargs["use_reentrant"]
+        )
+
+        if use_reentrant:
+            model.enable_input_require_grads()
+
+        return model
 
     # Get the per-token log probabilities for the completions for the model and the reference model
+    @profiling_decorator
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
-        # Transfer inputs to model's device if needed
-        device = next(model.parameters()).device
-        input_ids = input_ids.to(device)
-        attention_mask = attention_mask.to(device)
-        
         # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
         logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1).logits
         logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
@@ -478,11 +615,9 @@ class GRPOTrainer(Trainer):
         # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
         # See https://github.com/huggingface/trl/issues/2770
         logits = logits[:, -logits_to_keep:]
-        
-        # Transfer result back to original device
-        result = selective_log_softmax(logits, input_ids)
-        return result.to(self.accelerator.device)
+        return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
 
+    @profiling_decorator
     def _move_model_to_vllm(self):
         with unwrap_model_for_generation(
             self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
@@ -492,7 +627,6 @@ class GRPOTrainer(Trainer):
             if is_peft_model(unwrapped_model):
                 unwrapped_model.merge_adapter()
                 state_dict = unwrapped_model.state_dict()
-                unwrapped_model.unmerge_adapter()
                 # Remove base_model and base_layer prefixes
                 state_dict = {
                     k.removeprefix("base_model.model.").replace(".base_layer", ""): v for k, v in state_dict.items()
@@ -507,15 +641,30 @@ class GRPOTrainer(Trainer):
                 }
             else:
                 state_dict = unwrapped_model.state_dict()
-        if self.accelerator.is_main_process:
-            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-            llm_model.load_weights(state_dict.items())
+            if self.accelerator.is_main_process:
+                llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                llm_model.load_weights(state_dict.items())
+            # Unmerge the adapter to restore the model to its original state.
+            # This must be done after loading weights to ensure they correspond to the merged state.
+            if is_peft_model(unwrapped_model):
+                unwrapped_model.unmerge_adapter()
 
+    @profiling_decorator
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
+        if self.state.global_step % self.num_iterations == 0:
+            inputs = self._generate_and_score_completions(inputs)
+            self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] = inputs
+        else:
+            inputs = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]
+        self._step += 1
+        return inputs
+
+    def _generate_and_score_completions(
+        self, inputs: dict[str, Union[torch.Tensor, Any]]
+    ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
-        
         prompt_inputs = self.processing_class(
             prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
         )
@@ -536,8 +685,17 @@ class GRPOTrainer(Trainer):
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             all_prompts_text = gather_object(prompts_text)
             if self.accelerator.is_main_process:
-                outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
-                completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+                # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
+                # num_generations outputs for each one. This is faster than generating outputs for each duplicate
+                # prompt individually.
+                ordered_set_of_prompts = list(dict.fromkeys(all_prompts_text))
+                all_outputs = self.llm.generate(
+                    ordered_set_of_prompts, sampling_params=self.sampling_params, use_tqdm=False
+                )
+                completion_ids = []
+                for outputs in all_outputs:
+                    for output in outputs.outputs:
+                        completion_ids.append(output.token_ids)
             else:
                 completion_ids = [None] * len(all_prompts_text)
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
@@ -578,7 +736,18 @@ class GRPOTrainer(Trainer):
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
         with torch.inference_mode():
-            if self.ref_model is not None:
+            # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
+            # computation here, and use per_token_logps.detach() instead.
+            if self.num_iterations > 1:
+                old_per_token_logps = self._get_per_token_logps(
+                    self.model, prompt_completion_ids, attention_mask, logits_to_keep
+                )
+            else:
+                old_per_token_logps = None
+
+            if self.beta == 0.0:
+                ref_per_token_logps = None
+            elif self.ref_model is not None:
                 ref_per_token_logps = self._get_per_token_logps(
                     self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
                 )
@@ -675,25 +844,17 @@ class GRPOTrainer(Trainer):
             if wandb.run is not None and self.accelerator.is_main_process:
                 wandb.log({"completions": wandb.Table(dataframe=df)})
 
-        # After computing all rewards and advantages, duplicate the data for multiple updates
-        if self.args.update_to_data_ratio > 1:
-            # Duplicate all tensors in the prepared inputs
-            prompt_ids = prompt_ids.repeat(self.args.update_to_data_ratio, 1)
-            prompt_mask = prompt_mask.repeat(self.args.update_to_data_ratio, 1)
-            completion_ids = completion_ids.repeat(self.args.update_to_data_ratio, 1)
-            completion_mask = completion_mask.repeat(self.args.update_to_data_ratio, 1)
-            ref_per_token_logps = ref_per_token_logps.repeat(self.args.update_to_data_ratio, 1)
-            advantages = advantages.repeat(self.args.update_to_data_ratio)
-
         return {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
+            "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
         }
 
+    @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
@@ -708,33 +869,37 @@ class GRPOTrainer(Trainer):
         per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 
         # Compute the KL divergence between the model and the reference model
-        ref_per_token_logps = inputs["ref_per_token_logps"]
-        per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+        if self.beta != 0.0:
+            ref_per_token_logps = inputs["ref_per_token_logps"]
+            per_token_kl = (
+                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+            )
 
-        # x - x.detach() allows for preserving gradients from x
+        # Compute the loss
         advantages = inputs["advantages"]
-        # PPO clipping: ratio = exp(current_logp - old_logp). For GRPO, we can treat the reference model's logps
-        # as pi_old. Then we clamp ratio to [1 - clip_range, 1 + clip_range].
-        # Below, 'ppo_clip_range' is assumed to be in self.args; define it in GRPOConfig if not present yet.
-
-        ratio = torch.exp(per_token_logps - ref_per_token_logps)           # shape (batch, seq_len)
-        ratio_adv = ratio * advantages.unsqueeze(1)                       # ratio times advantage
-        clipped_ratio = torch.clamp(ratio, 1.0 - self.args.ppo_clip_range, 1.0 + self.args.ppo_clip_range)
-        clipped_ratio_adv = clipped_ratio * advantages.unsqueeze(1)
-
-        # PPO objective: - min(ratio_adv, clipped_ratio_adv)
-        # Also include the KL penalty as in GRPO: - self.beta * per_token_kl
-        per_token_loss = -(torch.min(ratio_adv, clipped_ratio_adv) - self.beta * per_token_kl)
-
-        loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's computation (see
+        # _generate_and_score_completions) and use per_token_logps.detach() instead.
+        old_per_token_logps = inputs["old_per_token_logps"] if self.num_iterations > 1 else per_token_logps.detach()
+        coef_1 = torch.exp(per_token_logps - old_per_token_logps)
+        coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon)
+        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
+        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        if self.beta != 0.0:
+            per_token_loss = per_token_loss + self.beta * per_token_kl
+        loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
 
         # Log the metrics
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
         self._metrics["completion_length"].append(completion_length)
 
-        mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
-        self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+        if self.beta != 0.0:
+            mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+            self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
 
+        is_clipped = (per_token_loss1 < per_token_loss2).float()
+        clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
+        self._metrics["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
         return loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):

@@ -1,3 +1,17 @@
+# Copyright 2025 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -65,6 +79,8 @@ class GRPOConfig(TrainingArguments):
             If set, the `max_model_len` to use for vLLM. This could be useful when running with reduced
             `vllm_gpu_memory_utilization`, leading to a reduced KV cache size. If not set, vLLM will use the model
             context size, which might be much larger than the KV cache, leading to inefficiencies.
+        vllm_guided_decoding_regex (`str` or `None`, *optional*, defaults to `None`):
+            Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled.
 
         > Parameters that control the training
 
@@ -72,9 +88,12 @@ class GRPOConfig(TrainingArguments):
             Initial learning rate for [`AdamW`] optimizer. The default value replaces that of
             [`~transformers.TrainingArguments`].
         beta (`float`, *optional*, defaults to `0.04`):
-            KL coefficient.
-        ppo_clip_range (`float`, *optional*, defaults to `0.2`):
-            Clipping parameter for PPO. The policy ratio will be clipped to [1 - clip_range, 1 + clip_range].
+            KL coefficient. If `0.0`, the reference model is not loaded, reducing memory usage and improving training
+            speed.
+        num_iterations (`int`, *optional*, defaults to `1`):
+            Number of iterations per batch (denoted as μ in the algorithm).
+        epsilon (`float`, *optional*, defaults to `0.2`):
+            Epsilon value for clipping.
         reward_weights (`list[float]` or `None`, *optional*, defaults to `None`):
             Weights for each reward function. Must match the number of reward functions. If `None`, all rewards are
             weighted equally with weight `1.0`.
@@ -96,12 +115,6 @@ class GRPOConfig(TrainingArguments):
 
         log_completions (`bool`, *optional*, defaults to `False`):
             Whether to log the completions during training.
-
-        > Parameters that control the update-to-data ratio
-
-        update_to_data_ratio (`int`, *optional*, defaults to 1):
-            Number of times to iterate over each batch of data during the policy update phase.
-            Higher values mean more parameter updates per data collection step.
     """
 
     # Parameters that control the model and reference model
@@ -195,6 +208,10 @@ class GRPOConfig(TrainingArguments):
             "context size, which might be much larger than the KV cache, leading to inefficiencies."
         },
     )
+    vllm_guided_decoding_regex: Optional[str] = field(
+        default=None,
+        metadata={"help": "Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled."},
+    )
 
     # Parameters that control the training
     learning_rate: float = field(
@@ -206,13 +223,18 @@ class GRPOConfig(TrainingArguments):
     )
     beta: float = field(
         default=0.04,
-        metadata={"help": "KL coefficient."},
-    )
-    ppo_clip_range: float = field(
-        default=0.2,
         metadata={
-            "help": "Clipping parameter for PPO. The policy ratio will be clipped to [1 - clip_range, 1 + clip_range]."
+            "help": "KL coefficient. If `0.0`, the reference model is not loaded, reducing memory usage and improving "
+            "training speed."
         },
+    )
+    num_iterations: int = field(
+        default=1,
+        metadata={"help": "Number of iterations per batch (denoted as μ in the algorithm)."},
+    )
+    epsilon: float = field(
+        default=0.2,
+        metadata={"help": "Epsilon value for clipping."},
     )
     reward_weights: Optional[list[float]] = field(
         default=None,
@@ -248,13 +270,4 @@ class GRPOConfig(TrainingArguments):
     log_completions: bool = field(
         default=False,
         metadata={"help": "Whether to log the completions during training."},
-    )
-
-    # Parameters that control the update-to-data ratio
-    update_to_data_ratio: int = field(
-        default=1,
-        metadata={
-            "help": "Number of times to iterate over each batch of data during the policy update phase. "
-            "Higher values mean more parameter updates per data collection step."
-        },
     )

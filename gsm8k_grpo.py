@@ -102,12 +102,13 @@ def xmlcount_reward_func(completions, **kwargs) -> list[float]:
     return [count_xml(c) for c in contents]
 
 model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-ref_model_name = "Qwen/Qwen2.5-Math-1.5B-Instruct"
+ref_model_name = "Qwen/Qwen2.5-0.5B-Instruct"
 
-output_dir="outputs/Qwen-0.5B-GRPO-other-ref"
-run_name="Qwen-0.5B-GRPO-gsm8k-other-ref"
+output_dir="outputs/Qwen-0.5B-GRPO-utd4"
+run_name="Qwen-0.5B-GRPO-gsm8k-utd4"
 
 training_args = GRPOConfig(
+    seed=0,
     output_dir=output_dir,
     run_name=run_name,
     learning_rate=5e-6,
@@ -131,8 +132,9 @@ training_args = GRPOConfig(
     vllm_gpu_memory_utilization=.3,
     vllm_device="cuda:0",
     report_to="wandb",
-    update_to_data_ratio=2,
-    vllm_max_model_len=2048
+    num_iterations=4,
+    # update_to_data_ratio=1,
+    # vllm_max_model_len=2048
 )
 
 model = AutoModelForCausalLM.from_pretrained(
