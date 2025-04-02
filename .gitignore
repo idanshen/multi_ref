@@ -174,3 +174,5 @@ cython_debug/
 outputs/
 wandb/
 .vscode/
+dpo_output/
+scripts/*
