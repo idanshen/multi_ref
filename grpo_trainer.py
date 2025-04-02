@@ -42,13 +42,13 @@ from transformers import (
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.utils import is_peft_available
 
-from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
-from ..extras.profiling import profiling_decorator
-from ..import_utils import is_vllm_available
-from ..models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
-from .callbacks import SyncRefModelCallback
-from .grpo_config import GRPOConfig
-from .utils import generate_model_card, get_comet_experiment_url, pad, selective_log_softmax
+from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
+# from trl.extras.profiling import profiling_decorator
+from trl.import_utils import is_vllm_available
+from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
+from trl.trainer.callbacks import SyncRefModelCallback
+from grpo_config import GRPOConfig
+from trl.trainer.utils import generate_model_card, get_comet_experiment_url, pad, selective_log_softmax
 
 
 if is_peft_available():
@@ -256,6 +256,7 @@ class GRPOTrainer(Trainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
+        ref_model: Optional[Union[str, PreTrainedModel]] = None,
     ):
         # Args
         if args is None:
@@ -306,6 +307,8 @@ class GRPOTrainer(Trainer):
         if self.beta == 0.0:
             # If beta is 0.0, the reference model is not needed
             self.ref_model = None
+        elif ref_model is not None:
+            self.ref_model = ref_model
         elif is_deepspeed_zero3_enabled():
             self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
         elif is_peft_model(model):
@@ -515,11 +518,11 @@ class GRPOTrainer(Trainer):
         # Add tags to the model
         self.model.add_model_tags(self._tag_names)
 
-        if self.ref_model is not None:
-            if self.is_deepspeed_enabled:
-                self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
-            else:
-                self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
+        # if self.ref_model is not None:
+        #     if self.is_deepspeed_enabled:
+        #         self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
+        #     else:
+        #         self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
 
         if args.sync_ref_model:
             self.add_callback(SyncRefModelCallback(ref_model=self.ref_model, accelerator=self.accelerator))
@@ -605,7 +608,7 @@ class GRPOTrainer(Trainer):
         return model
 
     # Get the per-token log probabilities for the completions for the model and the reference model
-    @profiling_decorator
+    # @profiling_decorator
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
         # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
         logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1).logits
@@ -615,9 +618,9 @@ class GRPOTrainer(Trainer):
         # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
         # See https://github.com/huggingface/trl/issues/2770
         logits = logits[:, -logits_to_keep:]
-        return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
+        return selective_log_softmax(logits, input_ids.to(logits.device))  #  compute logprobs for the input tokens
 
-    @profiling_decorator
+    # @profiling_decorator
     def _move_model_to_vllm(self):
         with unwrap_model_for_generation(
             self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
@@ -649,7 +652,7 @@ class GRPOTrainer(Trainer):
             if is_peft_model(unwrapped_model):
                 unwrapped_model.unmerge_adapter()
 
-    @profiling_decorator
+    # @profiling_decorator
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         if self.state.global_step % self.num_iterations == 0:
             inputs = self._generate_and_score_completions(inputs)
@@ -664,13 +667,17 @@ class GRPOTrainer(Trainer):
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
+        # print(len(prompts))
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+        # print(len(prompts_text))
         prompt_inputs = self.processing_class(
             prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
         )
+        # print(prompt_inputs["input_ids"].shape)
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
-
+        # print(prompt_ids.shape)
+        
         if self.max_prompt_length is not None:
             prompt_ids = prompt_ids[:, -self.max_prompt_length :]
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
@@ -689,6 +696,7 @@ class GRPOTrainer(Trainer):
                 # num_generations outputs for each one. This is faster than generating outputs for each duplicate
                 # prompt individually.
                 ordered_set_of_prompts = list(dict.fromkeys(all_prompts_text))
+                # print(ordered_set_of_prompts)
                 all_outputs = self.llm.generate(
                     ordered_set_of_prompts, sampling_params=self.sampling_params, use_tqdm=False
                 )
@@ -748,9 +756,10 @@ class GRPOTrainer(Trainer):
             if self.beta == 0.0:
                 ref_per_token_logps = None
             elif self.ref_model is not None:
-                ref_per_token_logps = self._get_per_token_logps(
-                    self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
-                )
+                with torch.no_grad():   
+                    ref_per_token_logps = self._get_per_token_logps(
+                        self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
+                    )
             else:
                 with self.accelerator.unwrap_model(self.model).disable_adapter():
                     ref_per_token_logps = self._get_per_token_logps(
@@ -854,7 +863,7 @@ class GRPOTrainer(Trainer):
             "advantages": advantages,
         }
 
-    @profiling_decorator
+    # @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
@@ -870,7 +879,7 @@ class GRPOTrainer(Trainer):
 
         # Compute the KL divergence between the model and the reference model
         if self.beta != 0.0:
-            ref_per_token_logps = inputs["ref_per_token_logps"]
+            ref_per_token_logps = inputs["ref_per_token_logps"].to(per_token_logps.device)
             per_token_kl = (
                 torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
             )

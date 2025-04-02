@@ -9,10 +9,11 @@ class EnsembleModel(GenerationMixin, torch.nn.Module):
     """
     Ensemble model that takes two models and produce output from the geometric mean of their distributions.
     """
-    def __init__(self, model1, model2, alpha=0.5):
+    def __init__(self, model1, model2, ensemble_type="geometric", alpha=0.5):
         super().__init__()
         self.model1 = model1
         self.model2 = model2
+        self.ensemble_type = ensemble_type
         self.alpha = alpha  # Weight for model1 (1-alpha for model2)
         self.device = self.model1.device
         self.config = model1.config
@@ -35,7 +36,11 @@ class EnsembleModel(GenerationMixin, torch.nn.Module):
         Returns output on model1's device.
         """
         # Split past_key_values for each model if provided
-        past1, past2 = past_key_values
+        if past_key_values is None:
+            past1 = None
+            past2 = None
+        else:
+            past1, past2 = past_key_values
 
         # Remove problematic kwargs
         kwargs = {k: v for k, v in kwargs.items() 
@@ -52,25 +57,32 @@ class EnsembleModel(GenerationMixin, torch.nn.Module):
         outputs1 = self.model1(
             input_ids=input_ids.to(self.model1.device),
             past_key_values=past1,
+            use_cache=False,
             **kwargs1
         )
         
         outputs2 = self.model2(
             input_ids=input_ids.to(self.model2.device),
             past_key_values=past2,
+            use_cache=False,
             **kwargs2
         )
 
         # Obtain the raw logits and move them to model1's device
         logits1 = outputs1.logits
-        logits2 = outputs2.logits.to(self.model1.device)
+        logits2 = outputs2.logits
 
         # Convert logits to log-probabilities
         log_probs1 = F.log_softmax(logits1, dim=-1)
         log_probs2 = F.log_softmax(logits2, dim=-1)
-
+        print(log_probs1.shape)
         # Compute weighted combination in log-space
-        avg_log_probs = self.alpha * log_probs1 + (1 - self.alpha) * log_probs2
+        if self.ensemble_type == "geometric":
+            avg_log_probs = self.alpha * log_probs1 + (1 - self.alpha) * log_probs2
+        elif self.ensemble_type == "arithmetic":
+            avg_log_probs = torch.logsumexp(torch.stack([log_probs1.to(log_probs2.device) + torch.log(torch.tensor(self.alpha, device=log_probs2.device)), log_probs2 + torch.log(torch.tensor(1 - self.alpha, device=log_probs2.device))]), dim=0)
+        else:
+            raise ValueError(f"Invalid ensemble type: {self.ensemble_type}")
 
         # Merge the caches from both models
         new_past = (outputs1.past_key_values, outputs2.past_key_values)

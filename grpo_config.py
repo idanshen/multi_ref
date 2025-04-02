@@ -36,6 +36,12 @@ class GRPOConfig(TrainingArguments):
         model_init_kwargs (`dict[str, Any]` or `None`, *optional*, defaults to `None`):
             Keyword arguments for [`~transformers.AutoModelForCausalLM.from_pretrained`], used when the `model`
             argument of the [`GRPOTrainer`] is provided as a string.
+        multi_ref (`bool`, *optional*, defaults to `False`):
+            Whether to use multiple reference models.
+        ensemble_type (`str`, *optional*, defaults to `"geometric"`):
+            Ensemble type, can be `"geometric"` or `"arithmetic"`.
+        alpha (`float`, *optional*, defaults to `0.5`):
+            Alpha for the ensemble.
 
         > Parameters that control the data preprocessing
 
@@ -270,4 +276,19 @@ class GRPOConfig(TrainingArguments):
     log_completions: bool = field(
         default=False,
         metadata={"help": "Whether to log the completions during training."},
+    )
+
+    multi_ref: bool = field(
+        default=False,
+        metadata={"help": "Whether to use multiple reference models."},
+    )
+
+    ensemble_type: str = field(
+        default="geometric",
+        metadata={"help": "Ensemble type, can be 'geometric' or 'arithmetic'."},
+    )
+
+    alpha: float = field(
+        default=0.5,
+        metadata={"help": "Alpha for the ensemble."},
     )

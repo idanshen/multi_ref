@@ -1,15 +1,14 @@
 import re
 import torch
+import argparse
 from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from grpo_trainer import GRPOTrainer
 from grpo_config import GRPOConfig
+from ensemble_model import EnsembleModel
 
-"""
-TODO:
-- add evaluation on test set
-- implmenet bigger update to data ratio
-"""
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 # Load and prep dataset
 
@@ -102,10 +101,26 @@ def xmlcount_reward_func(completions, **kwargs) -> list[float]:
     return [count_xml(c) for c in contents]
 
 model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-ref_model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+ref_model_name = "Qwen/Qwen2.5-Math-1.5B-Instruct"
 
-output_dir="outputs/Qwen-0.5B-GRPO-utd4"
-run_name="Qwen-0.5B-GRPO-gsm8k-utd4"
+output_dir="outputs/Qwen-0.5B-GRPO-multi_ref"
+run_name="Qwen-0.5B-GRPO-gsm8k-multi_ref"
+
+# Add argument parser
+def parse_args():
+    parser = argparse.ArgumentParser(description='GRPO Training Arguments')
+    parser.add_argument('--multi_ref', type=bool, default=False, help='Use multiple reference models')
+    parser.add_argument('--ensemble_type', type=str, default="geometric", help='Ensemble type, can be "geometric" or "arithmetic"')
+    parser.add_argument('--alpha', type=float, default=0.5, help='Alpha for the ensemble')
+    parser.add_argument('--num_iterations', type=int, default=4, help='Number of training iterations')
+    parser.add_argument('--max_completion_length', type=int, default=1000, help='Maximum completion length')
+    parser.add_argument('--num_generations', type=int, default=8, help='Number of generations')
+    parser.add_argument('--train_batch_size', type=int, default=8, help='Training batch size')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=4, help='Gradient accumulation steps')
+    return parser.parse_args()
+
+# Replace the hardcoded values with args
+args = parse_args()
 
 training_args = GRPOConfig(
     seed=0,
@@ -119,35 +134,51 @@ training_args = GRPOConfig(
     lr_scheduler_type='cosine',
     logging_steps=1,
     bf16=True,
-    per_device_train_batch_size=16,
-    gradient_accumulation_steps=4,
-    num_generations=16,
+    per_device_train_batch_size=args.train_batch_size,
+    gradient_accumulation_steps=args.gradient_accumulation_steps,
+    num_generations=args.num_generations,
     max_prompt_length=256,
-    max_completion_length=200,
+    max_completion_length=args.max_completion_length,
     num_train_epochs=1,
-    save_steps=100,
+    save_steps=300,
     max_grad_norm=0.1,
     log_on_each_node=False,
     use_vllm=True,
     vllm_gpu_memory_utilization=.3,
     vllm_device="cuda:0",
     report_to="wandb",
-    num_iterations=4,
-    # update_to_data_ratio=1,
-    # vllm_max_model_len=2048
+    num_iterations=args.num_iterations,
+    multi_ref=args.multi_ref,
+    ensemble_type=args.ensemble_type,
+    alpha=args.alpha,
 )
 
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
     torch_dtype=torch.bfloat16,
     device_map=None
-).to("cuda")
+).to("cuda:0")
 
-ref_model = AutoModelForCausalLM.from_pretrained(
-    ref_model_name,
-    torch_dtype=torch.bfloat16,
-    device_map=None
-).to("cuda")
+if args.multi_ref:
+    model1 = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="cuda:1",  # First GPU
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16
+    )
+    model2 = AutoModelForCausalLM.from_pretrained(
+        ref_model_name,
+        device_map="cuda:1",  # Second GPU
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16
+    )
+    ref_model = EnsembleModel(model1, model2, ensemble_type=args.ensemble_type, alpha=args.alpha)
+else:
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        ref_model_name,
+        torch_dtype=torch.bfloat16,
+        device_map=None
+    ).to("cuda:0")
 
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 tokenizer.pad_token = tokenizer.eos_token
